@@ -741,13 +741,40 @@ def _latex_verbatim_ranges(text: str) -> list[tuple[int, int]]:
             ranges.append((m.start(), endm.end()))
     for m in _INLINE_VERBATIM_RE.finditer(text):
         delim = m.group(2)
+        start = m.end()
+        # \lstinline may carry a balanced '[language=...]' option group before
+        # the real delimiter, e.g. \lstinline[language=C]|code|. Skip it (and
+        # never treat '[' as a delimiter) so the following delimiter is used.
+        if m.group(1).startswith("lstinline") and delim == "[":
+            close = text.find("]", m.end())
+            if close < 0 or close + 1 >= len(text):
+                continue
+            start = close + 2
+            delim = text[close + 1]
         if delim.isspace() or delim.isalnum() or delim in "\\{}":
             continue
-        j = m.end()
-        k = text.find(delim, j)
+        k = text.find(delim, start)
         end = len(text) if k < 0 else k + 1
         ranges.append((m.start(), end))
     return ranges
+
+
+def _latex_line_iter_with_verbatim(text: str) -> Iterator[tuple[int, str, bool]]:
+    """Yield (offset, line, in_verbatim) for each line.
+
+    Flags lines that fall inside a verbatim/listings range so the % comment
+    passes in inspect_latex/clean_latex preserve literal percent-prefixed lines
+    in a verbatim or listings block.
+    """
+    ranges = _latex_verbatim_ranges(text)
+    ranges.sort(key=lambda r: r[0])
+    starts = [r[0] for r in ranges]
+    off = 0
+    for line in text.split("\n"):
+        idx = bisect.bisect_right(starts, off) - 1
+        in_vb = idx >= 0 and off < ranges[idx][1]
+        yield off, line, in_vb
+        off += len(line) + 1
 
 
 def _latex_matching_brace(text: str, open_idx: int) -> int:
@@ -992,7 +1019,17 @@ def _latex_iter_meta_commands(text: str):
     """
     ranges = _latex_comment_ranges(text)
     ranges.extend(_latex_verbatim_ranges(text))
+    # A % comment line nested inside a verbatim block would otherwise hide the
+    # enclosing verbatim range from the predecessor lookup, so merge overlapping
+    # and nested intervals before the binary search.
     ranges.sort(key=lambda r: r[0])
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    ranges = merged
     starts = [r[0] for r in ranges]
     for m in _META_CMD_OPEN_RE.finditer(text):
         pos = m.start()
@@ -1047,16 +1084,17 @@ def inspect_latex(text: str) -> tuple[bool, bool, list[str], dict]:
                 has_c2pa = True
             if ai or c2pa:
                 has_ai = True
-    for line in text.split("\n"):
+    for _off, line, in_verbatim in _latex_line_iter_with_verbatim(text):
         stripped = line.lstrip()
-        if stripped.startswith("%"):
-            drop, label, ai = _latex_comment_class(stripped)
-            if drop:
-                comments_dropped += 1
-                prefix = "latex ai:" if ai else "info: latex"
-                findings.append(f"{prefix} comment ({label})")
-                if ai:
-                    has_ai = True
+        if in_verbatim or not stripped.startswith("%"):
+            continue
+        drop, label, ai = _latex_comment_class(stripped)
+        if drop:
+            comments_dropped += 1
+            prefix = "latex ai:" if ai else "info: latex"
+            findings.append(f"{prefix} comment ({label})")
+            if ai:
+                has_ai = True
     details = {
         "commands": commands,
         "keys_dropped": keys_dropped,
@@ -1093,7 +1131,10 @@ def clean_latex(text: str) -> tuple[str, list[str]]:
 
     kept_lines: list[str] = []
     dropped = 0
-    for line in text.split("\n"):
+    for _off, line, in_verbatim in _latex_line_iter_with_verbatim(text):
+        if in_verbatim:
+            kept_lines.append(line)
+            continue
         stripped = line.lstrip()
         drop, label, _ai = (
             _latex_comment_class(stripped) if stripped.startswith("%") else (False, "", False)

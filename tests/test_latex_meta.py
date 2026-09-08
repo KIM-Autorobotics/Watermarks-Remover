@@ -212,6 +212,26 @@ def test_clean_latex_verbatim_example_preserved():
     assert r"\hypersetup{pdfcreator={Claude}}" in out
 
 
+def test_clean_latex_verbatim_with_comment_line_preserved():
+    """A '%' line and a following metadata example inside a verbatim block are
+    literal body and must survive cleaning and inspection."""
+    doc = r"""\documentclass{article}
+\begin{verbatim}
+% example config
+\hypersetup{pdfcreator={Claude}}
+\end{verbatim}
+\begin{document}hi\end{document}
+"""
+    out, _ = clean_latex(doc)
+    assert r"\hypersetup{pdfcreator={Claude}}" in out
+    assert "% example config" in out
+
+    _c2pa, ai, findings, _ = inspect_latex(doc)
+    assert ai is False
+    assert not any("pdfcreator" in f for f in findings)
+    assert not any("example config" in f for f in findings)
+
+
 def test_clean_latex_inline_verb_example_preserved():
     """Inline \\verb and \\lstinline examples are literal and left untouched."""
     doc = r"""\documentclass{article}
