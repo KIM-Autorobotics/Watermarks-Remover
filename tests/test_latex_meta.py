@@ -1,6 +1,6 @@
 """Tests for LaTeX (.tex/.ltx) container metadata inspection and cleaning.
 
-route a LaTeX source as a container (like Markdown/HTML), strip the
+Route a LaTeX source as a container (like Markdown/HTML), strip the
 compile-time PDF metadata it carries (\\hypersetup / \\pdfinfo) and the
 provenance/tooling comment lines, and keep processing the body as text.
 """
@@ -10,8 +10,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -20,8 +18,8 @@ from audit_lib import is_actionable, scan_file
 from container_meta import (
     clean_latex,
     detect_container_format,
-    inspect_latex,
     inspect_container,
+    inspect_latex,
 )
 from format_dispatch import classify, classify_bytes
 
@@ -60,7 +58,7 @@ def test_classify_latex_is_container():
 
 
 def test_inspect_latex_flags_ai_provenance():
-    c2pa, ai, findings, details = inspect_latex(SAMPLE)
+    _c2pa, ai, findings, details = inspect_latex(SAMPLE)
     assert ai is True
     assert ["commands", "keys_dropped", "comments_dropped"] == [
         "commands",
@@ -82,7 +80,7 @@ def test_inspect_latex_marks_c2pa():
 \hypersetup{pdftitle={x}, pdfcreator={Made with c2pa}}
 \begin{document}hi\end{document}
 """
-    c2pa, ai, findings, _ = inspect_latex(doc)
+    c2pa, ai, _findings, _ = inspect_latex(doc)
     assert c2pa is True
     assert ai is True
 
@@ -156,3 +154,84 @@ def test_latex_zero_width_surfaces_via_layer_a(tmp_path):
     assert subject_item["has_ai_metadata"] is False  # no metadata, just a carrier
     assert is_actionable(subject_item) is is_actionable(control_item)
     assert is_actionable(subject_item) is True
+
+
+def test_clean_latex_comment_brace_and_comma_do_not_close_block():
+    """A commented '}' or ',' inside a \\hypersetup block must not end it or
+    split a key, so the real keys that follow the comment are still parsed."""
+    doc = r"""\documentclass{article}
+\hypersetup{
+  colorlinks=true, % commented }, this } stays
+  pdftitle={T},
+  pdfauthor={Jane}, % commented , next } stays
+  pdfcreationdate={D:1},
+}
+\begin{document}hi\end{document}
+"""
+    out, _ = clean_latex(doc)
+    assert "colorlinks=true" in out
+    assert "pdftitle={T}" in out
+    assert "pdfauthor" not in out
+    assert "pdfcreationdate" not in out
+
+
+def test_clean_latex_apostrophe_does_not_break_pairs():
+    """An apostrophe in a title must not enter a quote pause that swallows the
+    following ',' — subsequent keys still get parsed (and cleared)."""
+    doc = r"""\documentclass{article}
+\hypersetup{pdftitle={Euler's Identity}, pdfauthor={Jane Doe}}
+\begin{document}hi\end{document}
+"""
+    out, _ = clean_latex(doc)
+    assert "pdftitle={Euler's Identity}" in out
+    assert "pdfauthor" not in out
+
+
+def test_clean_latex_pdf_date_fields_cleared():
+    """pdfcreationdate/pdfmoddate are cleared like the pdfinfo date fields."""
+    doc = r"""\documentclass{article}
+\hypersetup{pdftitle={T}, pdfcreationdate={D:20260101}, pdfmoddate={D:20260102}}
+\begin{document}hi\end{document}
+"""
+    out, _ = clean_latex(doc)
+    assert "pdfcreationdate" not in out
+    assert "pdfmoddate" not in out
+    assert "pdftitle={T}" in out
+
+
+def test_clean_latex_verbatim_example_preserved():
+    """A \\hypersetup shown inside a verbatim environment is literal body and
+    must not be treated as live metadata."""
+    doc = r"""\documentclass{article}
+\begin{verbatim}
+\hypersetup{pdfcreator={Claude}}
+\end{verbatim}
+\begin{document}hi\end{document}
+"""
+    out, _ = clean_latex(doc)
+    assert r"\hypersetup{pdfcreator={Claude}}" in out
+
+
+def test_clean_latex_inline_verb_example_preserved():
+    """Inline \\verb and \\lstinline examples are literal and left untouched."""
+    doc = r"""\documentclass{article}
+\verb|\hypersetup{pdfcreator={Claude}}|
+\lstinline!2|3!
+\begin{document}hi\end{document}
+"""
+    out, _ = clean_latex(doc)
+    assert r"\verb|\hypersetup{pdfcreator={Claude}}|" in out
+    assert r"\lstinline!2|3!" in out
+
+
+def test_clean_latex_linebreak_percent_is_comment():
+    """'\\\\%' is a linebreak then a % comment, so a metadata command inside it
+    (an even number of preceding backslashes) is not a live command."""
+    doc = r"""\documentclass{article}
+\\% \hypersetup{pdfcreator={Claude}}
+\begin{document}hi\end{document}
+"""
+    out, _ = clean_latex(doc)
+    # The comment line does not start with '%', so it survives; the \hypersetup
+    # inside the comment is skipped rather than cleaned.
+    assert r"\hypersetup{pdfcreator={Claude}}" in out

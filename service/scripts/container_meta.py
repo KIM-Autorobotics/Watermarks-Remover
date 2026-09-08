@@ -5,6 +5,7 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 """
 
 import base64
+import bisect
 import io
 import os
 import posixpath
@@ -666,7 +667,8 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
 _C2PA_RE = re.compile(r"c2pa|content.?credential|contentcredential", re.I)
 # \hypersetup keys that become document metadata; cleared regardless of value.
 _CLEAR_HYPER_KEYS: frozenset[str] = frozenset(
-    {"pdfauthor", "pdfsubject", "pdfcreator", "pdfproducer", "pdfkeywords"}
+    {"pdfauthor", "pdfsubject", "pdfcreator", "pdfproducer", "pdfkeywords",
+     "pdfcreationdate", "pdfmoddate"}
 )
 # \pdfinfo keys (leading '/' optional) that are provenance/dates; cleared always.
 _CLEAR_PDFINFO_KEYS: frozenset[str] = frozenset(
@@ -675,19 +677,40 @@ _CLEAR_PDFINFO_KEYS: frozenset[str] = frozenset(
 _META_CMD_OPEN_RE = re.compile(r"\\(hypersetup|pdfinfo)\b\s*\{")
 _LATEX_MAGIC_COMMENT_RE = re.compile(r"%\s*!\s*(?:TEX|TeX|BIB|LaTeX)\b")
 _LATEX_VIM_MODELINE_RE = re.compile(r"\bvim\s*:", re.I)
+# Verbatim/listings content and inline \verb / \lstinline spans are literal
+# document body, never live metadata, so metadata commands there must not be
+# cleaned (a \hypersetup shown as an example must survive).
+_VERBATIM_ENV_BEGIN_RE = re.compile(r"\\begin\{(verbatim\*?|lstlisting\*?|minted|Verbatim)\}", re.I)
+_VERBATIM_ENV_END_RE = re.compile(r"\\end\{(verbatim\*?|lstlisting\*?|minted|Verbatim)\}", re.I)
+_INLINE_VERBATIM_RE = re.compile(r"\\(verb\*?|lstinline\*?)(.)", re.I)
+
+
+def _is_latex_escaped(text: str, index: int) -> bool:
+    r"""True if text[index] is preceded by an odd number of backslashes.
+
+    ``\x`` escapes ``x``; ``\\`` is a linebreak. A '%' after an even (or zero)
+    backslash count starts a comment, after an odd count is a literal percent.
+    """
+    count = 0
+    j = index - 1
+    while j >= 0 and text[j] == "\\":
+        count += 1
+        j -= 1
+    return count % 2 == 1
 
 
 def _latex_comment_ranges(text: str) -> list[tuple[int, int]]:
     r"""Return [start, end) ranges that are % comments (to end of line).
 
-    A '%' starts a comment unless immediately preceded by a backslash (\% is a
-    literal percent sign). Used to avoid treating a \hypersetup/\pdfinfo that
-    appears *inside* a comment as a live metadata command.
+    A '%' starts a comment unless preceded by an odd number of backslashes
+    (\% is an escaped percent sign; \\% is a linebreak followed by a comment).
+    Used to avoid treating a \hypersetup/\pdfinfo that appears *inside* a
+    comment as a live metadata command.
     """
     ranges: list[tuple[int, int]] = []
     i, n = 0, len(text)
     while i < n:
-        if text[i] == "%" and (i == 0 or text[i - 1] != "\\"):
+        if text[i] == "%" and not _is_latex_escaped(text, i):
             start = i
             j = text.find("\n", i)
             end = n if j < 0 else j
@@ -698,8 +721,34 @@ def _latex_comment_ranges(text: str) -> list[tuple[int, int]]:
     return ranges
 
 
+def _latex_verbatim_ranges(text: str) -> list[tuple[int, int]]:
+    r"""Return [start, end) ranges of verbatim/listings content to skip.
+
+    Covers verbatim/verbatim*/lstlisting/minted/Verbatim environments and
+    inline \verb / \verb* / \lstinline spans (delimiter follows the command).
+    """
+    ranges: list[tuple[int, int]] = []
+    for m in _VERBATIM_ENV_BEGIN_RE.finditer(text):
+        endm = _VERBATIM_ENV_END_RE.search(text, m.end())
+        if endm:
+            ranges.append((m.start(), endm.end()))
+    for m in _INLINE_VERBATIM_RE.finditer(text):
+        delim = m.group(2)
+        if delim.isspace() or delim.isalnum() or delim in "\\{}":
+            continue
+        j = m.end()
+        k = text.find(delim, j)
+        end = len(text) if k < 0 else k + 1
+        ranges.append((m.start(), end))
+    return ranges
+
+
 def _latex_matching_brace(text: str, open_idx: int) -> int:
-    """Return the index of the '}' matching text[open_idx] == '{', or -1."""
+    r"""Return the '}' matching text[open_idx] == '{', or -1.
+
+    LaTeX % comments are skipped (an unescaped % runs to end of line), so a
+    '}' inside a comment cannot prematurely close the block.
+    """
     depth = 0
     i = open_idx
     n = len(text)
@@ -707,6 +756,12 @@ def _latex_matching_brace(text: str, open_idx: int) -> int:
         c = text[i]
         if c == "\\":
             i += 2
+            continue
+        if c == "%" and not _is_latex_escaped(text, i):
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            i = j + 1
             continue
         if c == "{":
             depth += 1
@@ -718,63 +773,61 @@ def _latex_matching_brace(text: str, open_idx: int) -> int:
     return -1
 
 
-def _latex_split_top_spans(s: str, sep: str = ",") -> list[tuple[int, int]]:
-    """Split *s* on *sep* at brace-depth 0, outside quotes. Returns (start,end)."""
-    spans: list[tuple[int, int]] = []
+def _latex_split_items(s: str) -> list[str]:
+    r"""Split a \hypersetup argument into top-level key=value item strings.
+
+    Commas at brace depth 0 delimit items; % comments are removed from the items
+    so a comment's comma/braces neither split nor affect a neighboring key.
+    Quotes are ordinary characters (no quote-mode state), so an apostrophe in a
+    title does not hide a following ','.
+    """
+    items: list[str] = []
     depth = 0
-    quote: str | None = None
-    start = 0
+    cur: list[str] = []
     i, n = 0, len(s)
     while i < n:
         c = s[i]
         if c == "\\":
+            cur.append(s[i : i + 2])
             i += 2
             continue
-        if quote is not None:
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-        if c in ("'", '"'):
-            quote = c
-            i += 1
+        if c == "%" and not _is_latex_escaped(s, i):
+            j = s.find("\n", i)
+            i = n if j < 0 else j + 1
             continue
         if c == "{":
             depth += 1
+            cur.append(c)
             i += 1
             continue
         if c == "}":
             depth -= 1
+            cur.append(c)
             i += 1
             continue
-        if c == sep and depth == 0:
-            spans.append((start, i))
-            start = i + 1
+        if c == "," and depth == 0:
+            items.append("".join(cur))
+            cur = []
             i += 1
             continue
+        cur.append(c)
         i += 1
-    spans.append((start, n))
-    return spans
+    items.append("".join(cur))
+    return items
 
 
 def _latex_split_key_value(item: str) -> tuple[str, str | None]:
-    r"""Split a \hypersetup 'key=value' item at the first top-level '='."""
+    r"""Split a \hypersetup 'key=value' item at the first top-level '='.
+
+    Quotes are ordinary characters (no quote-mode state), so an apostrophe in a
+    value does not conceal the '=' that follows it.
+    """
     depth = 0
-    quote: str | None = None
     i, n = 0, len(item)
     while i < n:
         c = item[i]
         if c == "\\":
             i += 2
-            continue
-        if quote is not None:
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-        if c in ("'", '"'):
-            quote = c
-            i += 1
             continue
         if c == "{":
             depth += 1
@@ -802,6 +855,10 @@ def _latex_pdfinfo_items(arg: str) -> list[tuple[str, str, int, int]]:
     while i < n:
         while i < n and arg[i].isspace():
             i += 1
+        if i < n and arg[i] == "%" and not _is_latex_escaped(arg, i):
+            j = arg.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
         if i >= n or arg[i] != "/":
             i += 1
             continue
@@ -850,10 +907,17 @@ def _latex_entry_class(key: str, value: str | None) -> tuple[bool, bool, bool]:
 
 
 def _latex_clean_hypersetup(arg: str) -> tuple[str | None, list[tuple[str, bool, bool]]]:
+    r"""Drop provenance entries from a \hypersetup argument.
+
+    Returns (new_arg, removed) where new_arg is None when the block should be
+    dropped entirely, and removed is [(key, ai, c2pa), ...] for the entries
+    cleared (AI/C2PA-provenance keys and values, plus the always-clear metadata
+    field names).
+    """
     kept: list[str] = []
     removed: list[tuple[str, bool, bool]] = []
-    for a, b in _latex_split_top_spans(arg):
-        item = arg[a:b].strip()
+    for raw in _latex_split_items(arg):
+        item = raw.strip()
         if not item:
             continue
         key, value = _latex_split_key_value(item)
@@ -873,6 +937,12 @@ def _latex_clean_hypersetup(arg: str) -> tuple[str | None, list[tuple[str, bool,
 
 
 def _latex_clean_pdfinfo(arg: str) -> tuple[str | None, list[tuple[str, bool, bool]]]:
+    r"""Drop provenance entries from a \pdfinfo argument.
+
+    Returns (new_arg, removed) with the same contract as _latex_clean_hypersetup;
+    the always-clear /Author /Creator /Producer /Subject /Keywords /CreationDate
+    /ModDate fields and any AI/C2PA-marker entry are removed, /Title is kept.
+    """
     kept: list[str] = []
     removed: list[tuple[str, bool, bool]] = []
     for key, value, _vs, _ve in _latex_pdfinfo_items(arg):
@@ -906,10 +976,21 @@ def _latex_comment_class(line: str) -> tuple[bool, str, bool]:
 
 
 def _latex_iter_meta_commands(text: str):
-    r"""Yield (cmd, arg, start, end) for each live \hypersetup/\pdfinfo block."""
+    r"""Yield (cmd, arg, start, end) for each live \hypersetup/\pdfinfo block.
+
+    Skips % comments and verbatim/listings content (so a \hypersetup shown as a
+    literal example is not treated as live metadata) and inline \verb/\lstinline
+    spans. The comment/verbatim ranges are merged and looked up with a binary
+    search, so an adversarial run of commands costs O(log n) per command.
+    """
     ranges = _latex_comment_ranges(text)
+    ranges.extend(_latex_verbatim_ranges(text))
+    ranges.sort(key=lambda r: r[0])
+    starts = [r[0] for r in ranges]
     for m in _META_CMD_OPEN_RE.finditer(text):
-        if any(a <= m.start() < b for a, b in ranges):
+        pos = m.start()
+        idx = bisect.bisect_right(starts, pos) - 1
+        if idx >= 0 and pos < ranges[idx][1]:
             continue
         cmd = m.group(1).lower()
         brace_idx = m.end() - 1
@@ -924,8 +1005,8 @@ def _latex_meta_key_values(cmd: str, arg: str) -> list[tuple[str, str | None]]:
     if cmd == "pdfinfo":
         return [(key, value) for key, value, _vs, _ve in _latex_pdfinfo_items(arg)]
     pairs: list[tuple[str, str | None]] = []
-    for a, b in _latex_split_top_spans(arg):
-        item = arg[a:b].strip()
+    for raw in _latex_split_items(arg):
+        item = raw.strip()
         if not item:
             continue
         key, value = _latex_split_key_value(item)
@@ -934,6 +1015,12 @@ def _latex_meta_key_values(cmd: str, arg: str) -> list[tuple[str, str | None]]:
 
 
 def inspect_latex(text: str) -> tuple[bool, bool, list[str], dict]:
+    r"""Inspect a LaTeX source for provenance/AI metadata and tooling comments.
+
+    Returns (has_c2pa, has_ai, findings, details); details carries command and
+    dropped-entry counts. Skips % comments and verbatim/listings content so
+    only live \hypersetup/\pdfinfo metadata and literal comment lines are seen.
+    """
     findings: list[str] = []
     has_ai = False
     has_c2pa = False
@@ -972,6 +1059,12 @@ def inspect_latex(text: str) -> tuple[bool, bool, list[str], dict]:
 
 
 def clean_latex(text: str) -> tuple[str, list[str]]:
+    r"""Strip LaTeX provenance metadata from a source.
+
+    Removes \hypersetup/\pdfinfo provenance entries and drops provenance-bearing
+    % comments plus % !TEX tooling comments and Emacs/Vim modelines. Verbatim and
+    listings content is left untouched. Returns (text, actions).
+    """
     actions: list[str] = []
     out: list[str] = []
     last = 0
