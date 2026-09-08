@@ -667,8 +667,15 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
 _C2PA_RE = re.compile(r"c2pa|content.?credential|contentcredential", re.I)
 # \hypersetup keys that become document metadata; cleared regardless of value.
 _CLEAR_HYPER_KEYS: frozenset[str] = frozenset(
-    {"pdfauthor", "pdfsubject", "pdfcreator", "pdfproducer", "pdfkeywords",
-     "pdfcreationdate", "pdfmoddate"}
+    {
+        "pdfauthor",
+        "pdfsubject",
+        "pdfcreator",
+        "pdfproducer",
+        "pdfkeywords",
+        "pdfcreationdate",
+        "pdfmoddate",
+    }
 )
 # \pdfinfo keys (leading '/' optional) that are provenance/dates; cleared always.
 _CLEAR_PDFINFO_KEYS: frozenset[str] = frozenset(
