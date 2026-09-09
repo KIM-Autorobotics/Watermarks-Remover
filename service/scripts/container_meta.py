@@ -742,11 +742,27 @@ def _latex_verbatim_ranges(text: str) -> list[tuple[int, int]]:
     for m in _INLINE_VERBATIM_RE.finditer(text):
         delim = m.group(2)
         start = m.end()
-        # \lstinline may carry a balanced '[language=...]' option group before
-        # the real delimiter, e.g. \lstinline[language=C]|code|. Skip it (and
-        # never treat '[' as a delimiter) so the following delimiter is used.
+        # \lstinline may carry a '[language=...]' option group before the real
+        # delimiter, e.g. \lstinline[language=C]|code|. Skip the group and never
+        # treat '[' as a delimiter so the following delimiter is used. The scan
+        # is brace-aware (a braced value may contain ']', e.g. caption={a]b}).
         if m.group(1).startswith("lstinline") and delim == "[":
-            close = text.find("]", m.end())
+            close = -1
+            depth = 0
+            j = m.end()
+            while j < len(text):
+                ch = text[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                elif ch == "]" and depth == 0:
+                    close = j
+                    break
+                j += 1
             if close < 0 or close + 1 >= len(text):
                 continue
             start = close + 2
@@ -759,6 +775,22 @@ def _latex_verbatim_ranges(text: str) -> list[tuple[int, int]]:
     return ranges
 
 
+def _latex_merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and merge overlapping/nested [start, end) ranges.
+
+    A nested range (e.g. an inline \\verb span inside a verbatim environment)
+    would otherwise become the predecessor of the binary-search lookup and
+    hide the enclosing range from it.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges, key=lambda r: r[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _latex_line_iter_with_verbatim(text: str) -> Iterator[tuple[int, str, bool]]:
     """Yield (offset, line, in_verbatim) for each line.
 
@@ -766,8 +798,7 @@ def _latex_line_iter_with_verbatim(text: str) -> Iterator[tuple[int, str, bool]]
     passes in inspect_latex/clean_latex preserve literal percent-prefixed lines
     in a verbatim or listings block.
     """
-    ranges = _latex_verbatim_ranges(text)
-    ranges.sort(key=lambda r: r[0])
+    ranges = _latex_merge_ranges(_latex_verbatim_ranges(text))
     starts = [r[0] for r in ranges]
     off = 0
     for line in text.split("\n"):
@@ -1019,17 +1050,10 @@ def _latex_iter_meta_commands(text: str):
     """
     ranges = _latex_comment_ranges(text)
     ranges.extend(_latex_verbatim_ranges(text))
-    # A % comment line nested inside a verbatim block would otherwise hide the
-    # enclosing verbatim range from the predecessor lookup, so merge overlapping
-    # and nested intervals before the binary search.
-    ranges.sort(key=lambda r: r[0])
-    merged: list[tuple[int, int]] = []
-    for start, end in ranges:
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    ranges = merged
+    # A comment or inline-verbatim range nested inside a verbatim block would
+    # otherwise hide the enclosing verbatim range from the predecessor lookup,
+    # so merge overlapping/nested intervals before the binary search.
+    ranges = _latex_merge_ranges(ranges)
     starts = [r[0] for r in ranges]
     for m in _META_CMD_OPEN_RE.finditer(text):
         pos = m.start()

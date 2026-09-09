@@ -217,6 +217,7 @@ def test_clean_latex_verbatim_with_comment_line_preserved():
     literal body and must survive cleaning and inspection."""
     doc = r"""\documentclass{article}
 \begin{verbatim}
+\verb|x|
 % example config
 \hypersetup{pdfcreator={Claude}}
 \end{verbatim}
