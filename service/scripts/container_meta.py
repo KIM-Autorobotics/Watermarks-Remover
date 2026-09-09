@@ -7,6 +7,7 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 import base64
 import bisect
 import io
+import json
 import os
 import posixpath
 import re
@@ -2910,7 +2911,9 @@ def _pdf_structured_blob(data: bytes) -> bytes:
     return no_streams + b"\n" + xmp
 
 
-def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
+def inspect_pdf(
+    path: Path, data: bytes, *, depth: int = 0, include_attachments: bool = True
+) -> tuple[bool, bool, list[str], dict]:
     findings: list[str] = []
     has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
     findings.extend(f"pdf-structured:{h}" for h in hits)
@@ -2936,7 +2939,29 @@ def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
     probe_note = c2patool_probe_note(tools)
     if probe_note:
         findings.append(probe_note)
-    return has_c2pa, has_ai or has_c2pa, findings, {"tools": tools}
+
+    # Embedded-file attachments are stream payloads, so the deterministic scan
+    # above deliberately cannot see them. Extract and inspect each one the same
+    # way we would a standalone file. Callers deciding whether to run the
+    # Ghostscript deep-image pass pass ``include_attachments=False`` so an
+    # attachment-only marker does not trigger a re-distill that would drop the
+    # attachments themselves.
+    details: dict[str, Any] = {"tools": tools}
+    if include_attachments:
+        attachments, truncated = _pdf_inspect_attachments(path, None, depth=depth)
+        if attachments:
+            for a in attachments:
+                findings.append(f"attachment:{a['name']}:{a.get('kind', 'unknown')}")
+                if a.get("has_ai_metadata"):
+                    has_ai = True
+                    findings.append(f"attachment:{a['name']}:AI metadata")
+                if a.get("has_c2pa"):
+                    has_c2pa = True
+                    findings.append(f"attachment:{a['name']}:C2PA")
+            details["attachments"] = attachments
+            if truncated:
+                details["attachments_truncated"] = True
+    return has_c2pa, has_ai or has_c2pa, findings, details
 
 
 def _blank_xmp_packets(data: bytes) -> tuple[bytes, int]:
@@ -3279,7 +3304,450 @@ def _run_ghostscript(
     return True
 
 
-def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[list[str], dict]:
+# ---------------------------------------------------------------------------
+# PDF embedded-file attachments
+# ---------------------------------------------------------------------------
+
+CLEAN_ATTACHMENT_MODES = frozenset({"auto", "always", "never"})
+DEFAULT_CLEAN_ATTACHMENTS = "always"
+MAX_ATTACHMENT_DEPTH = 3
+MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+_QPDF_ATTACH_TIMEOUT = 60.0
+
+
+def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
+    """Convert an ISO-8601 timestamp to qpdf's PDF date form (best-effort).
+
+    ``None`` or an unparseable string returns ``None`` so callers can simply
+    omit the date option and let qpdf stamp "now" rather than erroring.
+    """
+    if not iso:
+        return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})([+-])(\d{2}):(\d{2})", iso)
+    if not m:
+        return None
+    y, mo, d, h, mi, s, sign, oh, om = m.groups()
+    return f"D:{y}{mo}{d}{h}{mi}{s}{sign}{oh}'{om}'"
+
+
+def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> list[dict]:
+    """Enumerate a PDF's embedded files via ``qpdf --json``.
+
+    Returns a list of ``{key, name, mimetype, description, creationdate,
+    modificationdate}`` in PDF order. Empty when qpdf is absent, the budget is
+    spent, or the PDF carries no attachments.
+    """
+    qpdf = which("qpdf")
+    if not qpdf:
+        return []
+    if deadline is not None and deadline.spent():
+        return []
+    try:
+        r = subprocess.run(
+            [qpdf, "--json", "--json-key=attachments", "--", safe_arg(str(path))],
+            capture_output=True,
+            text=True,
+            timeout=(
+                _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
+            ),
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+            creationflags=subprocess_creationflags,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    try:
+        payload = json.loads(r.stdout)
+    except Exception:
+        return []
+    out: list[dict] = []
+    for key, info in (payload.get("attachments") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        names = info.get("names") or {}
+        streams = info.get("streams") or {}
+        stream = next(iter(streams.values()), {}) if streams else {}
+        out.append(
+            {
+                "key": key,
+                "name": info.get("preferredname") or key,
+                "mimetype": stream.get("mimetype") or None,
+                "description": info.get("description"),
+                "creationdate": stream.get("creationdate"),
+                "modificationdate": stream.get("modificationdate"),
+                "named_F": names.get("/F"),
+                "named_UF": names.get("/UF"),
+            }
+        )
+    return out
+
+
+def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline | None") -> int:
+    """Extract one embedded file to *tmp*. Returns the byte count, or -1."""
+    qpdf = which("qpdf")
+    if not qpdf:
+        return -1
+    try:
+        with tmp.open("wb") as out:
+            r = subprocess.run(
+                [qpdf, f"--show-attachment={key}", "--", safe_arg(str(path))],
+                stdout=out,
+                stderr=subprocess.PIPE,
+                timeout=(
+                    _QPDF_ATTACH_TIMEOUT
+                    if deadline is None
+                    else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
+                ),
+                check=False,
+                preexec_fn=subprocess_preexec_fn,
+                creationflags=subprocess_creationflags,
+            )
+    except Exception:
+        return -1
+    if r.returncode != 0:
+        return -1
+    try:
+        return tmp.stat().st_size
+    except OSError:
+        return -1
+
+
+def _classify_attachment(name: str, data: bytes) -> str:
+    """Route an attachment to the same pipelines as a standalone file."""
+    from format_dispatch import classify_bytes  # local: avoids an import cycle
+
+    return classify_bytes(data, Path(name).suffix)
+
+
+def _pdf_inspect_attachments(
+    path: Path, deadline: "_Deadline | None", depth: int = 0
+) -> tuple[list[dict], bool]:
+    """Inspect each embedded file and report its own provenance.
+
+    Returns ``(attachments, truncated)`` where each attachment is
+    ``{name, mimetype, key, kind, has_c2pa, has_ai_metadata, findings}``.
+    ``truncated`` is true when the scan stopped at the depth cap or budget so
+    callers can report an incomplete rather than "clean" answer.
+    """
+    if depth > MAX_ATTACHMENT_DEPTH:
+        return [], True
+    if deadline is not None and deadline.spent():
+        return [], True
+    attachments = _pdf_attachment_list(path, deadline)
+    results: list[dict] = []
+    truncated = False
+    with tempfile.TemporaryDirectory(prefix="wr-att-insp-") as staging:
+        for i, att in enumerate(attachments):
+            # Sanitise the temp name: keep the suffix so classification works,
+            # drop any directory separators in the attachment's own name.
+            safe_name = Path(att["name"]).name or f"att-{i}"
+            tmp = Path(staging) / f"att-{i}{Path(safe_name).suffix}"
+            n = _pdf_show_attachment(path, att["key"], tmp, deadline)
+            if n < 0:
+                results.append({**att, "kind": "unknown", "error": "extract failed"})
+                continue
+            if n > MAX_ATTACHMENT_BYTES:
+                results.append({**att, "kind": "unknown", "error": "attachment too large"})
+                truncated = True
+                continue
+            data = tmp.read_bytes()
+            kind = _classify_attachment(att["name"], data)
+            has_c2pa, has_ai, findings = _inspect_attachment_bytes(tmp, data, kind, depth)
+            results.append(
+                {
+                    **att,
+                    "kind": kind,
+                    "has_c2pa": has_c2pa,
+                    "has_ai_metadata": has_ai,
+                    "findings": findings,
+                }
+            )
+            if deadline is not None and deadline.spent():
+                truncated = True
+                break
+    return results, truncated
+
+
+def _inspect_attachment_bytes(
+    tmp: Path, data: bytes, kind: str, depth: int
+) -> tuple[bool, bool, list[str]]:
+    """Inspect an extracted attachment, recursing into nested containers."""
+    if kind == "text":
+        from text_unicode import inspect_text  # local import avoids a cycle
+
+        ta = inspect_text(data.decode("utf-8", errors="surrogateescape"))
+        return False, bool(ta.suspicious_total), [f"layer-a x{ta.suspicious_total}"]
+    if kind == "image":
+        from image_meta import inspect_image
+
+        rep = inspect_image(tmp, data=data)
+        return rep.has_c2pa, rep.has_ai_metadata, rep.findings
+    if kind == "av":
+        from av_meta import inspect_av
+
+        rep = inspect_av(tmp, data=data)
+        return rep.has_c2pa, rep.has_ai_metadata, rep.findings
+    if kind == "container":
+        rep = inspect_container(tmp, data=data, _depth=depth + 1)
+        return rep.has_c2pa, rep.has_ai_metadata, rep.findings
+    return False, False, [f"unsupported attachment kind: {kind}"]
+
+
+def _pdf_extract_attachments(
+    path: Path, deadline: "_Deadline | None", staging: Path
+) -> tuple[list[dict], list[dict]]:
+    """Extract every embedded file into *staging*.
+
+    Returns ``(ok, skipped)``: ``ok`` entries carry ``in_path``; ``skipped``
+    entries carry an ``error`` (extract failed / over size cap) so the clean
+    pass can report what it could not touch rather than dropping it silently.
+    Used up front in ``clean_pdf`` so attachment bytes are preserved even when
+    the Ghostscript deep-image pass — which re-distills the page and drops
+    embedded files — runs later.
+    """
+    attachments = _pdf_attachment_list(path, deadline)
+    ok: list[dict] = []
+    skipped: list[dict] = []
+    for i, att in enumerate(attachments):
+        safe_name = Path(att["name"]).name or f"att-{i}"
+        in_path = staging / f"{i}-in{Path(safe_name).suffix}"
+        n = _pdf_show_attachment(path, att["key"], in_path, deadline)
+        if n < 0:
+            skipped.append({**att, "error": "extract failed"})
+            continue
+        if n > MAX_ATTACHMENT_BYTES:
+            skipped.append({**att, "error": "attachment too large"})
+            continue
+        ok.append({**att, "in_path": in_path})
+    return ok, skipped
+
+
+def _pdf_clean_attachments(
+    path: Path,
+    dest: Path,
+    actions: list[str],
+    deadline: "_Deadline | None",
+    mode: str,
+    depth: int = 0,
+) -> dict[str, Any]:
+    """Strip embedded-file metadata, re-embedding cleaned bytes via qpdf.
+
+    Attachments are extracted from *path* (the original, unmodified input) and
+    re-embedded into *dest*, because some earlier pass (the Ghostscript
+    deep-image re-distill) may have dropped them from *dest*. Returns
+    ``{"attachments": [...], "processed": bool, "qpdf_absent": bool}``.
+    """
+    qpdf = which("qpdf")
+    if not qpdf:
+        actions.append(
+            "warning: embedded-file attachments left in place; install qpdf for the attachment pass"
+        )
+        return {"attachments": [], "processed": False, "qpdf_absent": True}
+    if depth > MAX_ATTACHMENT_DEPTH:
+        actions.append(f"warning: attachment recursion capped at depth {MAX_ATTACHMENT_DEPTH}")
+        return {"attachments": [], "processed": False, "qpdf_absent": False}
+    if deadline is not None and deadline.spent():
+        actions.append("attachment pass skipped: clean budget exhausted")
+        return {"attachments": [], "processed": False, "qpdf_absent": False}
+
+    results: list[dict] = []
+    processed = False
+    with tempfile.TemporaryDirectory(prefix="wr-att-") as staging:
+        attachments, skipped = _pdf_extract_attachments(path, deadline, Path(staging))
+        if skipped:
+            for att in skipped:
+                actions.append(f"skipped attachment '{att['name']}': {att['error']}")
+                results.append({**att, "kind": "unknown", "cleaned": False, "error": att["error"]})
+        if not attachments:
+            if not skipped:
+                actions.append("no embedded attachments to clean")
+            return {"attachments": results, "processed": False, "qpdf_absent": False}
+
+        # Did a re-distill drop the attachments from dest? If not, re-embedding
+        # only the changed ones is enough; if so, every attachment is restored.
+        dest_has = bool(_pdf_attachment_list(dest, deadline))
+        for i, att in enumerate(attachments):
+            if deadline is not None and deadline.spent():
+                actions.append("attachment pass stopped: clean budget exhausted")
+                break
+            name = att["name"]
+            in_path = att["in_path"]
+            data = in_path.read_bytes()
+            ext = Path(name).suffix or Path(in_path.name).suffix
+            kind = _classify_attachment(name, data)
+            has_c2pa, has_ai, findings = _inspect_attachment_bytes(in_path, data, kind, depth)
+            should_clean = mode == "always" or (mode == "auto" and (has_c2pa or has_ai))
+            # The report must not leak the on-disk staging path.
+            report_att = {k: v for k, v in att.items() if k != "in_path"}
+            if not should_clean:
+                results.append(
+                    {
+                        **report_att,
+                        "kind": kind,
+                        "cleaned": False,
+                        "still_has_c2pa": has_c2pa,
+                        "still_has_ai_metadata": has_ai,
+                        "findings": findings,
+                        "actions": [],
+                    }
+                )
+                # A destroyed attachment must still come back, original bytes.
+                if not dest_has and not _add_attachment(
+                    dest, att, in_path, staging, remove_existing=False
+                ):
+                    results[-1]["error"] = "re-embed failed"
+                continue
+            cleaned_bytes, clean_actions = _clean_attachment_bytes(in_path, data, kind, mode, depth)
+            if cleaned_bytes is None:
+                results.append(
+                    {**report_att, "kind": kind, "cleaned": False, "error": "clean failed"}
+                )
+                continue
+            processed = True
+            clean_path = Path(staging) / f"att-{i}-out{ext}"
+            safe_write_bytes(clean_path, cleaned_bytes)
+            if not _add_attachment(dest, att, clean_path, staging, remove_existing=dest_has):
+                results.append(
+                    {
+                        **report_att,
+                        "kind": kind,
+                        "cleaned": False,
+                        "error": "re-embed failed",
+                        "actions": clean_actions,
+                    }
+                )
+                actions.append(f"failed to re-embed cleaned attachment '{name}'")
+                continue
+            clean_actions.append(f"attachment '{name}': re-embedded")
+            rem_c2pa, rem_ai, rem_findings = _inspect_attachment_bytes(
+                clean_path, cleaned_bytes, kind, depth
+            )
+            results.append(
+                {
+                    **report_att,
+                    "kind": kind,
+                    "cleaned": True,
+                    "still_has_c2pa": rem_c2pa,
+                    "still_has_ai_metadata": rem_ai,
+                    "findings": rem_findings,
+                    "actions": clean_actions,
+                }
+            )
+
+    if processed:
+        actions.append("embedded-file attachments cleaned")
+    return {"attachments": results, "processed": processed, "qpdf_absent": False}
+
+
+def _add_attachment(
+    dest: Path,
+    att: dict[str, Any],
+    add_path: Path,
+    staging: str,
+    *,
+    remove_existing: bool,
+) -> bool:
+    """Add (and optionally replace) one attachment's bytes in *dest* in place.
+
+    qpdf rewrites the document, so the result is staged and swapped in via the
+    safe writer. ``remove_existing`` is False when a prior re-distill dropped
+    the attachment, in which case the *add* must not try to remove a key that
+    no longer exists.
+    """
+    tmp = Path(staging) / "rebuilt.pdf"
+    cmd: list[str] = []
+    if remove_existing:
+        cmd.append(f"--remove-attachment={att['key']}")
+    cmd += ["--add-attachment", safe_arg(str(add_path))]
+    cmd += [f"--key={att['key']}", f"--filename={att['name'] or att['key']}"]
+    if att.get("mimetype"):
+        cmd += [f"--mimetype={att['mimetype']}"]
+    if att.get("description"):
+        cmd += [f"--description={att['description']}"]
+    to = _pdf_iso_to_pdf_date(att.get("creationdate"))
+    if to:
+        cmd += [f"--creationdate={to}"]
+    td = _pdf_iso_to_pdf_date(att.get("modificationdate"))
+    if td:
+        cmd += [f"--moddate={td}"]
+    cmd += ["--", safe_arg(str(dest)), safe_arg(str(tmp))]
+    qpdf = which("qpdf")
+    if not qpdf:
+        return False
+    try:
+        r = subprocess.run(
+            [qpdf, *cmd],
+            capture_output=True,
+            text=True,
+            timeout=_QPDF_ATTACH_TIMEOUT,
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+            creationflags=subprocess_creationflags,
+        )
+    except Exception:
+        return False
+    if r.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        return False
+    safe_write_bytes(dest, tmp.read_bytes())
+    return True
+
+
+def _clean_attachment_bytes(
+    tmp: Path, data: bytes, kind: str, mode: str, depth: int
+) -> tuple[bytes | None, list[str]]:
+    """Clean an extracted attachment with the matching unified pipeline."""
+    if kind == "text":
+        from text_unicode import clean_text
+
+        cleaned, stats = clean_text(data.decode("utf-8", errors="surrogateescape"))
+        return cleaned.encode("utf-8"), [
+            f"text layer A: removed={stats['removed_count']} replaced={stats['replaced_count']}"
+        ]
+    if kind == "image":
+        from image_meta import clean_image
+
+        dest = tmp.with_name(tmp.name + ".cleaned")
+        result = clean_image(tmp, dest, strip_all_metadata=(mode == "always"))
+        if not dest.is_file():
+            return None, []
+        return dest.read_bytes(), result.get("actions", [])
+    if kind == "av":
+        from av_meta import clean_av
+
+        dest = tmp.with_name(tmp.name + ".cleaned")
+        result = clean_av(tmp, dest, strip_all_metadata=(mode == "always"))
+        if not dest.is_file():
+            return None, []
+        return dest.read_bytes(), result.get("actions", [])
+    if kind == "container":
+        dest = tmp.with_name(tmp.name + ".cleaned")
+        result = clean_container(
+            tmp,
+            dest,
+            fmt=None,
+            also_layer_a_text=True,
+            deep_images="auto",
+            normalize_spaces=True,
+            clean_attachments=mode,
+            _depth=depth + 1,
+        )
+        if not dest.is_file():
+            return None, []
+        return dest.read_bytes(), result.get("actions", [])
+    return None, [f"unsupported attachment kind: {kind}"]
+
+
+def clean_pdf(
+    path: Path,
+    dest: Path,
+    *,
+    deep_images: str = "auto",
+    clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
+    depth: int = 0,
+) -> tuple[list[str], dict]:
     """Best-effort PDF clean. Prefers exiftool; falls back to XMP strip warning.
 
     ``deep_images`` controls the Ghostscript re-distill that reaches metadata
@@ -3293,6 +3761,15 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     * ``"lossless"`` -- deep pass without the recompressing escalation, so
       image data is never touched.
     * ``"never"`` -- skip it.
+
+    ``clean_attachments`` controls the pass over embedded files (paperclips):
+
+    * ``"always"`` (default) -- clean every attachment's metadata
+      (``strip_all_metadata`` semantics on the attachment), recursing into
+      nested containers regardless of markers.
+    * ``"auto"`` -- clean an attachment only when it carries AI/C2PA provenance
+      markers; recurse with the same rule.
+    * ``"never"`` -- leave attachments untouched.
     """
     actions: list[str] = []
     data = path.read_bytes()
@@ -3303,6 +3780,11 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     if deep_images not in DEEP_IMAGE_MODES:
         raise ValueError(
             f"deep_images must be one of {sorted(DEEP_IMAGE_MODES)}, got {deep_images!r}"
+        )
+    if clean_attachments not in CLEAN_ATTACHMENT_MODES:
+        raise ValueError(
+            f"clean_attachments must be one of {sorted(CLEAN_ATTACHMENT_MODES)}, "
+            f"got {clean_attachments!r}"
         )
 
     deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
@@ -3355,7 +3837,10 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
 
     def _markers_left() -> bool:
         current = dest.read_bytes()
-        res_c2pa, res_ai, _f, _d = inspect_pdf(dest, current)
+        # include_attachments=False: attachment markers are handled by the
+        # attachment pass, and ignoring them here keeps the deep-image pass from
+        # running (and dropping the attachments) on an attachment-only marker.
+        res_c2pa, res_ai, _f, _d = inspect_pdf(dest, current, include_attachments=False)
         # inspect_pdf excludes stream payloads, so ask the streams directly too:
         # without c2patool nothing else would notice a manifest that only exists
         # inside an image.
@@ -3433,16 +3918,36 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     if c2patool:
         actions.append("c2patool available for inspect; strip via exiftool/re-export")
 
+    attachments: dict[str, Any] = {"attachments": [], "processed": False, "qpdf_absent": False}
+    attachment_degraded = False
+    if clean_attachments != "never":
+        attachments = _pdf_clean_attachments(
+            path, dest, actions, deadline, clean_attachments, depth=depth
+        )
+        if attachments.get("qpdf_absent"):
+            attachment_degraded = True
+        # Re-settle document-level metadata: re-embedding attachments via qpdf
+        # re-serializes the file, which can re-expose a /Producer.
+        if attachments.get("processed") and exiftool:
+            if _exiftool_strip(exiftool, dest, actions, deadline):
+                rewritten = _pdf_structural_rewrite(dest, actions, deadline) or rewritten
+            else:
+                attachment_degraded = True
+
     meta: dict[str, Any] = {
         "mode": document_mode,
         "structural_rewrite": rewritten,
         "deep_images": mode,
         "deep_image_pass": deep_ran,
         "images_reencoded": reencoded,
+        "attachments": attachments["attachments"],
+        "attachments_processed": attachments["processed"],
     }
     if not exiftool:
         # The deep pass may well have run, but the document-level strip was
         # the stdlib one, so the result is still best-effort.
+        meta["degraded"] = True
+    elif attachment_degraded:
         meta["degraded"] = True
     return actions, meta
 
@@ -3452,7 +3957,9 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
 # ---------------------------------------------------------------------------
 
 
-def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInspectReport:
+def inspect_container(
+    path: Path, *, data: bytes | None = None, _depth: int = 0
+) -> ContainerInspectReport:
     """Inspect a container for provenance, AI metadata, and Layer-A carriers.
 
     Delegates to the format-specific inspector and unions in a Layer-A scan of
@@ -3476,7 +3983,7 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
     if fmt == "svg":
         has_c2pa, has_ai, findings, details = inspect_svg(data)
     elif fmt == "pdf":
-        has_c2pa, has_ai, findings, details = inspect_pdf(path, data)
+        has_c2pa, has_ai, findings, details = inspect_pdf(path, data, depth=_depth)
         tools = details.pop("tools", {})
     elif fmt == "docx":
         has_c2pa, has_ai, findings, details = inspect_docx(data, zip_budget)
@@ -3602,6 +4109,8 @@ def clean_container(
     also_layer_a_text: bool = True,
     deep_images: str = "auto",
     normalize_spaces: bool = True,
+    clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
+    _depth: int = 0,
 ) -> dict[str, Any]:
     """Clean container metadata; optionally Layer-A scrub text bodies for md/html.
 
@@ -3622,7 +4131,13 @@ def clean_container(
         cleaned, actions = clean_svg(data)
         safe_write_bytes(dest, cleaned)
     elif fmt == "pdf":
-        actions, meta_extra = clean_pdf(path, dest, deep_images=deep_images)
+        actions, meta_extra = clean_pdf(
+            path,
+            dest,
+            deep_images=deep_images,
+            clean_attachments=clean_attachments,
+            depth=_depth,
+        )
         meta.update(meta_extra)
     elif fmt == "docx":
         cleaned, actions = clean_docx(
