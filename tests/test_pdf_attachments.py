@@ -250,10 +250,17 @@ def test_invalid_utf8_text_attachment_cleans_without_error(tmp_path):
     _actions, meta = clean_pdf(src, tmp_path / "out.pdf")
 
     assert meta["attachments_processed"] is True
-    assert isinstance(_show_attachment(tmp_path, "bin.txt", tmp_path / "out.pdf"), bytes)
+    # surrogateescape must round-trip the invalid bytes, not just avoid a crash.
+    assert _show_attachment(tmp_path, "bin.txt", tmp_path / "out.pdf") == b"hello\xff\xfegoodbye"
+
+
+needs_gs = pytest.mark.skipif(
+    container_meta.which_ghostscript() is None, reason="ghostscript not installed"
+)
 
 
 @needs_qpdf
+@needs_gs
 def test_never_restores_attachments_after_deep_image_pass(tmp_path):
     """A re-distill can drop attachments; `never` must still bring them back."""
     payload = b"do not clean me"
@@ -266,6 +273,8 @@ def test_never_restores_attachments_after_deep_image_pass(tmp_path):
         clean_attachments="never",
     )
 
+    # The deep pass must actually run, or this test proves nothing.
+    assert meta["deep_image_pass"] is True
     assert meta["attachments_processed"] is False
     assert _show_attachment(tmp_path, "keep.txt", tmp_path / "out.pdf") == payload
 

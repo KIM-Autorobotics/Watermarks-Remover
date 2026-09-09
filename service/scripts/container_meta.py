@@ -6,6 +6,7 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 
 import base64
 import bisect
+import contextlib
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import posixpath
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import zipfile
@@ -3391,6 +3393,24 @@ def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> lis
     return out
 
 
+def _watchdog_kill(process: "subprocess.Popen[bytes]", seconds: float) -> threading.Event:
+    """Return a stop Event; a daemon thread kills *process* unless it is set.
+
+    The main thread reads qpdf's stdout in chunks; this watchdog enforces the
+    timeout on a read that would otherwise block forever (e.g. a hung qpdf that
+    produces no output), since the inter-chunk deadline check never fires then.
+    """
+    stop = threading.Event()
+
+    def _watch() -> None:
+        if not stop.wait(seconds):
+            with contextlib.suppress(OSError):  # already exited/reaped
+                process.kill()
+
+    threading.Thread(target=_watch, daemon=True).start()
+    return stop
+
+
 def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline | None") -> int:
     """Extract one embedded file to *tmp*, bounding the write to the size cap.
 
@@ -3399,13 +3419,15 @@ def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline |
     subprocess is terminated and *tmp* is left partial), or ``-1`` on failure.
     qpdf's output is consumed in bounded chunks so an embedded stream that
     expands well past the cap is not written to disk in full before being
-    rejected.
+    rejected, and a watchdog enforces the deadline/``_QPDF_ATTACH_TIMEOUT`` even
+    when qpdf stops producing output.
     """
     qpdf = which("qpdf")
     if not qpdf:
         return -1
     limit = MAX_ATTACHMENT_BYTES
     total = 0
+    timeout = _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
     try:
         with tmp.open("wb") as out:
             p = subprocess.Popen(
@@ -3413,11 +3435,12 @@ def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline |
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 # Same preexec_fn resource-limit guard used by every subprocess
-                # in this module; the bounded read+kill below additionally caps
-                # qpdf's output.
+                # in this module; the bounded read+kill below also caps qpdf's
+                # output.
                 preexec_fn=subprocess_preexec_fn,  # noqa: PLW1509
                 creationflags=subprocess_creationflags,
             )
+            stop = _watchdog_kill(p, timeout)
             try:
                 rc = None
                 while True:
@@ -3433,14 +3456,10 @@ def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline |
                         return limit + 1
                     out.write(chunk)
                 p.stdout.close()
-                rc = p.wait(
-                    timeout=(
-                        _QPDF_ATTACH_TIMEOUT
-                        if deadline is None
-                        else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
-                    )
-                )
+                rc = p.wait(timeout=max(0.1, timeout))
             finally:
+                stop.set()
+                p.stdout.close()
                 if p.poll() is None:
                     p.kill()
                     p.wait()
@@ -3528,7 +3547,10 @@ def _inspect_attachment_bytes(
         return rep.has_c2pa, rep.has_ai_metadata, rep.findings
     if kind == "container":
         rep = inspect_container(tmp, data=data, _depth=depth + 1, deadline=deadline)
-        return rep.has_c2pa, rep.has_ai_metadata, rep.findings
+        findings = list(rep.findings)
+        if rep.details.get("attachments_truncated"):
+            findings.append("nested attachment scan truncated (depth cap or budget)")
+        return rep.has_c2pa, rep.has_ai_metadata, findings
     return False, False, [f"unsupported attachment kind: {kind}"]
 
 
