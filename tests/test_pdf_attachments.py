@@ -254,6 +254,35 @@ def test_invalid_utf8_text_attachment_cleans_without_error(tmp_path):
     assert _show_attachment(tmp_path, "bin.txt", tmp_path / "out.pdf") == b"hello\xff\xfegoodbye"
 
 
+@needs_qpdf
+def test_attachment_dates_survive_reembed(tmp_path):
+    """Re-embedding must keep the original timestamps, not stamp "now"."""
+    src = tmp_path / "base.pdf"
+    note = tmp_path / "note.txt"
+    note.write_bytes(b"hello")
+    subprocess.run(
+        [
+            QPDF,
+            "--empty",
+            "--add-attachment",
+            str(note),
+            "--filename=note.txt",
+            "--key=note.txt",
+            "--creationdate=D:20200101120000+00'00'",
+            "--",
+            str(src),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    original = container_meta._pdf_attachment_list(src)[0]["creationdate"]
+
+    _actions, meta = clean_pdf(src, tmp_path / "out.pdf")
+
+    assert meta["attachments_processed"] is True
+    assert container_meta._pdf_attachment_list(tmp_path / "out.pdf")[0]["creationdate"] == original
+
+
 needs_gs = pytest.mark.skipif(
     container_meta.which_ghostscript() is None, reason="ghostscript not installed"
 )

@@ -3325,17 +3325,29 @@ _QPDF_ATTACH_TIMEOUT = 60.0
 
 
 def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
-    """Convert an ISO-8601 timestamp to qpdf's PDF date form (best-effort).
+    """Convert an ISO-8601 (or native PDF-date) timestamp to qpdf's PDF date form.
 
-    ``None`` or an unparseable string returns ``None`` so callers can simply
-    omit the date option and let qpdf stamp "now" rather than erroring.
+    ``qpdf --json`` reports attachment dates in ISO-8601, but some qpdf outputs
+    hand back the native ``D:YYYYMMDDHHMMSS±HH'MM'`` form. Accept both so the
+    original timestamps survive re-embedding. ``None`` or an unparseable string
+    returns ``None`` so callers can simply omit the date option and let qpdf
+    stamp "now" rather than erroring.
     """
     if not iso:
         return None
-    m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})([+-])(\d{2}):(\d{2})", iso)
+    if re.match(r"^D:\d{14}.*$", iso):
+        # Already in qpdf's expected form; return as-is for round-tripping.
+        return iso
+    # qpdf reports the offset form (…-08:00) or normalizes UTC to a "Z" suffix.
+    m = re.match(
+        r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:([+-])(\d{2}):(\d{2})|Z)",
+        iso,
+    )
     if not m:
         return None
     y, mo, d, h, mi, s, sign, oh, om = m.groups()
+    if sign is None:  # "Z" == UTC
+        sign, oh, om = "+", "00", "00"
     return f"D:{y}{mo}{d}{h}{mi}{s}{sign}{oh}'{om}'"
 
 
@@ -3656,7 +3668,7 @@ def _pdf_clean_attachments(
                 )
                 # A destroyed attachment must still come back, original bytes.
                 if not dest_has and not _add_attachment(
-                    dest, att, in_path, staging, remove_existing=False
+                    dest, att, in_path, staging, remove_existing=False, deadline=deadline
                 ):
                     results[-1]["error"] = "re-embed failed"
                 continue
@@ -3669,7 +3681,9 @@ def _pdf_clean_attachments(
             processed = True
             clean_path = Path(staging) / f"att-{i}-out{ext}"
             safe_write_bytes(clean_path, cleaned_bytes)
-            if not _add_attachment(dest, att, clean_path, staging, remove_existing=dest_has):
+            if not _add_attachment(
+                dest, att, clean_path, staging, remove_existing=dest_has, deadline=deadline
+            ):
                 results.append(
                     {
                         **report_att,
@@ -3709,6 +3723,7 @@ def _add_attachment(
     staging: str,
     *,
     remove_existing: bool,
+    deadline: "_Deadline | None" = None,
 ) -> bool:
     """Add (and optionally replace) one attachment's bytes in *dest* in place.
 
@@ -3742,7 +3757,9 @@ def _add_attachment(
             [qpdf, *cmd],
             capture_output=True,
             text=True,
-            timeout=_QPDF_ATTACH_TIMEOUT,
+            timeout=(
+                _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
+            ),
             check=False,
             preexec_fn=subprocess_preexec_fn,
             creationflags=subprocess_creationflags,
