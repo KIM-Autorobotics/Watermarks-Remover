@@ -29,6 +29,7 @@ SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from container_meta import (
+    _meta_tag_is_ai,
     clean_html,
     clean_markdown,
     inspect_html,
@@ -229,13 +230,29 @@ def test_unambiguous_marker_in_meta_content_is_still_flagged() -> None:
     assert has_ai, findings
 
 
-def test_marker_outside_content_attribute_is_still_flagged() -> None:
-    """Only `content` gets the prose rule; other attributes keep the old scan."""
-    page = (
-        "<html><head>"
-        '<meta itemprop="creator" content="Claude" data-ai-generated="true">'
-        "</head><body>x</body></html>"
-    )
+@pytest.mark.parametrize(
+    "tag",
+    [
+        # The same string in `content` and in another attribute: blanking the
+        # value with str.replace erases both copies, and the tag reads clean.
+        '<meta property="Claude" content="Claude">',
+        '<meta itemprop="Anthropic" content="Anthropic">',
+        '<meta name="synthid" content="synthid">',
+        # A marker in an attribute the name parser does not read at all.
+        '<meta itemprop="c2pa" content="a note about cards">',
+        # Unquoted content attribute -- falls back to the whole-tag scan.
+        "<meta name=x content=Claude>",
+    ],
+)
+def test_marker_outside_content_attribute_is_still_flagged(tag: str) -> None:
+    """Only `content` gets the prose rule; other attributes keep the old scan.
+
+    The first version of this test carried a `data-ai-generated` attribute as
+    well, so it passed through inspect_html's separate data-ai* branch and
+    proved nothing about the split it was named for.
+    """
+    assert _meta_tag_is_ai(tag), tag
+    page = f"<html><head>{tag}</head><body>x</body></html>"
     _c2, has_ai, findings, _d = inspect_html(page)
     assert has_ai, findings
 

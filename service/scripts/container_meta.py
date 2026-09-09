@@ -1267,6 +1267,12 @@ def _is_cms_generator_meta(tag: str) -> bool:
     return not (_GENERATOR_AI_RE.search(attrs.get("content", "")) or _GENERATOR_AI_RE.search(tag))
 
 
+_META_CONTENT_VALUE_RE = re.compile(
+    r"""(\bcontent\s*=\s*)(["'])[^"']*\2""",
+    re.I,
+)
+
+
 def _meta_tag_is_ai(tag: str) -> bool:
     """True when an HTML <meta> tag is evidence of a provenance mark.
 
@@ -1278,7 +1284,11 @@ def _meta_tag_is_ai(tag: str) -> bool:
     attrs = _meta_attrs(tag)
     name = attrs.get("name") or attrs.get("property") or attrs.get("generator") or ""
     content = attrs.get("content", "")
-    skeleton = tag.replace(content, " ") if content else tag
+    # Blank the `content` attribute specifically. A plain str.replace of the
+    # value would also erase an identical string sitting in another attribute
+    # -- <meta property="Claude" content="Claude"> would lose both copies and
+    # read clean -- which is the opposite of the guarantee this split makes.
+    skeleton = _META_CONTENT_VALUE_RE.sub(r"\g<1>\g<2>\g<2>", tag)
     if AI_META_NAME_RE.search(skeleton) or any(
         h.decode("ascii", "ignore").lower() in skeleton.lower() for h in AI_META_HINTS[:12]
     ):
