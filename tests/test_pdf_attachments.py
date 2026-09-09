@@ -239,3 +239,45 @@ def test_oversized_attachment_kept_and_warned(tmp_path, monkeypatch):
     assert att["error"] == "attachment too large"
     assert any("too large" in a for a in actions)
     assert _show_attachment(tmp_path, "big.txt", tmp_path / "out.pdf") == b"0123456789"
+
+
+@needs_qpdf
+def test_invalid_utf8_text_attachment_cleans_without_error(tmp_path):
+    """Invalid UTF-8 in a text attachment must not abort clean_pdf."""
+    src = _pdf_with_attachments(tmp_path, [("bin.txt", b"hello\xff\xfegoodbye")])
+
+    # Default is `always`; the text pass re-encodes with surrogateescape.
+    _actions, meta = clean_pdf(src, tmp_path / "out.pdf")
+
+    assert meta["attachments_processed"] is True
+    assert isinstance(_show_attachment(tmp_path, "bin.txt", tmp_path / "out.pdf"), bytes)
+
+
+@needs_qpdf
+def test_never_restores_attachments_after_deep_image_pass(tmp_path):
+    """A re-distill can drop attachments; `never` must still bring them back."""
+    payload = b"do not clean me"
+    src = _pdf_with_attachments(tmp_path, [("keep.txt", payload)])
+
+    _actions, meta = clean_pdf(
+        src,
+        tmp_path / "out.pdf",
+        deep_images="always",
+        clean_attachments="never",
+    )
+
+    assert meta["attachments_processed"] is False
+    assert _show_attachment(tmp_path, "keep.txt", tmp_path / "out.pdf") == payload
+
+
+@needs_qpdf
+def test_inspect_attachments_respects_deadline(tmp_path):
+    """`/inspect` must bound the attachment scan and report truncation."""
+    src = _pdf_with_attachments(tmp_path, [("note.txt", b"hi")])
+
+    attachments, truncated = container_meta._pdf_inspect_attachments(
+        src, container_meta._Deadline(0), depth=0
+    )
+
+    assert attachments == []
+    assert truncated is True

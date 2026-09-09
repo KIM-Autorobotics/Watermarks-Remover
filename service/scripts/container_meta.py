@@ -2912,7 +2912,12 @@ def _pdf_structured_blob(data: bytes) -> bytes:
 
 
 def inspect_pdf(
-    path: Path, data: bytes, *, depth: int = 0, include_attachments: bool = True
+    path: Path,
+    data: bytes,
+    *,
+    depth: int = 0,
+    include_attachments: bool = True,
+    deadline: "_Deadline | None" = None,
 ) -> tuple[bool, bool, list[str], dict]:
     findings: list[str] = []
     has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
@@ -2948,7 +2953,9 @@ def inspect_pdf(
     # attachments themselves.
     details: dict[str, Any] = {"tools": tools}
     if include_attachments:
-        attachments, truncated = _pdf_inspect_attachments(path, None, depth=depth)
+        if deadline is None:
+            deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+        attachments, truncated = _pdf_inspect_attachments(path, deadline, depth=depth)
         if attachments:
             for a in attachments:
                 findings.append(f"attachment:{a['name']}:{a.get('kind', 'unknown')}")
@@ -3385,33 +3392,63 @@ def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> lis
 
 
 def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline | None") -> int:
-    """Extract one embedded file to *tmp*. Returns the byte count, or -1."""
+    """Extract one embedded file to *tmp*, bounding the write to the size cap.
+
+    Returns the byte count on success (``<= MAX_ATTACHMENT_BYTES``),
+    ``MAX_ATTACHMENT_BYTES + 1`` when the attachment exceeds the cap (the
+    subprocess is terminated and *tmp* is left partial), or ``-1`` on failure.
+    qpdf's output is consumed in bounded chunks so an embedded stream that
+    expands well past the cap is not written to disk in full before being
+    rejected.
+    """
     qpdf = which("qpdf")
     if not qpdf:
         return -1
+    limit = MAX_ATTACHMENT_BYTES
+    total = 0
     try:
         with tmp.open("wb") as out:
-            r = subprocess.run(
+            p = subprocess.Popen(
                 [qpdf, f"--show-attachment={key}", "--", safe_arg(str(path))],
-                stdout=out,
-                stderr=subprocess.PIPE,
-                timeout=(
-                    _QPDF_ATTACH_TIMEOUT
-                    if deadline is None
-                    else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
-                ),
-                check=False,
-                preexec_fn=subprocess_preexec_fn,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                # Same preexec_fn resource-limit guard used by every subprocess
+                # in this module; the bounded read+kill below additionally caps
+                # qpdf's output.
+                preexec_fn=subprocess_preexec_fn,  # noqa: PLW1509
                 creationflags=subprocess_creationflags,
             )
+            try:
+                rc = None
+                while True:
+                    if deadline is not None and deadline.spent():
+                        p.kill()
+                        return -1
+                    chunk = p.stdout.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        p.kill()
+                        return limit + 1
+                    out.write(chunk)
+                p.stdout.close()
+                rc = p.wait(
+                    timeout=(
+                        _QPDF_ATTACH_TIMEOUT
+                        if deadline is None
+                        else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
+                    )
+                )
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
     except Exception:
         return -1
-    if r.returncode != 0:
+    if rc != 0:
         return -1
-    try:
-        return tmp.stat().st_size
-    except OSError:
-        return -1
+    return total
 
 
 def _classify_attachment(name: str, data: bytes) -> str:
@@ -3454,7 +3491,7 @@ def _pdf_inspect_attachments(
                 continue
             data = tmp.read_bytes()
             kind = _classify_attachment(att["name"], data)
-            has_c2pa, has_ai, findings = _inspect_attachment_bytes(tmp, data, kind, depth)
+            has_c2pa, has_ai, findings = _inspect_attachment_bytes(tmp, data, kind, depth, deadline)
             results.append(
                 {
                     **att,
@@ -3471,7 +3508,7 @@ def _pdf_inspect_attachments(
 
 
 def _inspect_attachment_bytes(
-    tmp: Path, data: bytes, kind: str, depth: int
+    tmp: Path, data: bytes, kind: str, depth: int, deadline: "_Deadline | None" = None
 ) -> tuple[bool, bool, list[str]]:
     """Inspect an extracted attachment, recursing into nested containers."""
     if kind == "text":
@@ -3490,7 +3527,7 @@ def _inspect_attachment_bytes(
         rep = inspect_av(tmp, data=data)
         return rep.has_c2pa, rep.has_ai_metadata, rep.findings
     if kind == "container":
-        rep = inspect_container(tmp, data=data, _depth=depth + 1)
+        rep = inspect_container(tmp, data=data, _depth=depth + 1, deadline=deadline)
         return rep.has_c2pa, rep.has_ai_metadata, rep.findings
     return False, False, [f"unsupported attachment kind: {kind}"]
 
@@ -3577,7 +3614,9 @@ def _pdf_clean_attachments(
             data = in_path.read_bytes()
             ext = Path(name).suffix or Path(in_path.name).suffix
             kind = _classify_attachment(name, data)
-            has_c2pa, has_ai, findings = _inspect_attachment_bytes(in_path, data, kind, depth)
+            has_c2pa, has_ai, findings = _inspect_attachment_bytes(
+                in_path, data, kind, depth, deadline
+            )
             should_clean = mode == "always" or (mode == "auto" and (has_c2pa or has_ai))
             # The report must not leak the on-disk staging path.
             report_att = {k: v for k, v in att.items() if k != "in_path"}
@@ -3622,7 +3661,7 @@ def _pdf_clean_attachments(
                 continue
             clean_actions.append(f"attachment '{name}': re-embedded")
             rem_c2pa, rem_ai, rem_findings = _inspect_attachment_bytes(
-                clean_path, cleaned_bytes, kind, depth
+                clean_path, cleaned_bytes, kind, depth, deadline
             )
             results.append(
                 {
@@ -3703,7 +3742,9 @@ def _clean_attachment_bytes(
         from text_unicode import clean_text
 
         cleaned, stats = clean_text(data.decode("utf-8", errors="surrogateescape"))
-        return cleaned.encode("utf-8"), [
+        # Re-encode with surrogateescape so invalid bytes preserved by the
+        # decode are round-tripped instead of raising UnicodeEncodeError.
+        return cleaned.encode("utf-8", errors="surrogateescape"), [
             f"text layer A: removed={stats['removed_count']} replaced={stats['replaced_count']}"
         ]
     if kind == "image":
@@ -3920,7 +3961,10 @@ def clean_pdf(
 
     attachments: dict[str, Any] = {"attachments": [], "processed": False, "qpdf_absent": False}
     attachment_degraded = False
-    if clean_attachments != "never":
+    # Even in "never" mode the deep-image pass may have dropped the embedded
+    # files from dest, so the originals still have to be restored. The helper
+    # re-embeds unchanged bytes when mode is "never", so nothing is cleaned.
+    if clean_attachments != "never" or deep_ran:
         attachments = _pdf_clean_attachments(
             path, dest, actions, deadline, clean_attachments, depth=depth
         )
@@ -3958,7 +4002,11 @@ def clean_pdf(
 
 
 def inspect_container(
-    path: Path, *, data: bytes | None = None, _depth: int = 0
+    path: Path,
+    *,
+    data: bytes | None = None,
+    _depth: int = 0,
+    deadline: "_Deadline | None" = None,
 ) -> ContainerInspectReport:
     """Inspect a container for provenance, AI metadata, and Layer-A carriers.
 
@@ -3983,7 +4031,9 @@ def inspect_container(
     if fmt == "svg":
         has_c2pa, has_ai, findings, details = inspect_svg(data)
     elif fmt == "pdf":
-        has_c2pa, has_ai, findings, details = inspect_pdf(path, data, depth=_depth)
+        has_c2pa, has_ai, findings, details = inspect_pdf(
+            path, data, depth=_depth, deadline=deadline
+        )
         tools = details.pop("tools", {})
     elif fmt == "docx":
         has_c2pa, has_ai, findings, details = inspect_docx(data, zip_budget)
