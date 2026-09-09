@@ -5,6 +5,7 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 """
 
 import base64
+import bisect
 import io
 import os
 import posixpath
@@ -221,6 +222,8 @@ def detect_container_format(path: Path, data: bytes | None = None) -> str:
         return "html"
     if ext in (".md", ".markdown", ".mdx"):
         return "markdown"
+    if ext in (".tex", ".ltx"):
+        return "latex"
     if data is not None:
         if data[:4] == b"%PDF":
             return "pdf"
@@ -649,6 +652,528 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
     if not actions:
         actions.append("no AI frontmatter keys or embedded data URIs removed")
     return out, actions
+
+
+# ---------------------------------------------------------------------------
+# LaTeX (.tex / .ltx)
+# ---------------------------------------------------------------------------
+#
+# A LaTeX source carries provenance as compile-time PDF metadata (\hypersetup
+# and \pdfinfo) and as markup comments (header blocks, % !TEX tooling comments,
+# Emacs/Vim modelines). inspect_latex/clean_latex mirror the markdown handlers:
+# inspect reports which of these carry AI/provenance markers, clean removes them
+# (aggressively: always-clear provenance field names, not only AI-named keys).
+
+_C2PA_RE = re.compile(r"c2pa|content.?credential|contentcredential", re.I)
+# \hypersetup keys that become document metadata; cleared regardless of value.
+_CLEAR_HYPER_KEYS: frozenset[str] = frozenset(
+    {
+        "pdfauthor",
+        "pdfsubject",
+        "pdfcreator",
+        "pdfproducer",
+        "pdfkeywords",
+        "pdfcreationdate",
+        "pdfmoddate",
+    }
+)
+# \pdfinfo keys (leading '/' optional) that are provenance/dates; cleared always.
+_CLEAR_PDFINFO_KEYS: frozenset[str] = frozenset(
+    {"author", "subject", "keywords", "creator", "producer", "creationdate", "moddate"}
+)
+_META_CMD_OPEN_RE = re.compile(r"\\(hypersetup|pdfinfo)\b\s*\{")
+_LATEX_MAGIC_COMMENT_RE = re.compile(r"%\s*!\s*(?:TEX|TeX|BIB|LaTeX)\b")
+_LATEX_VIM_MODELINE_RE = re.compile(r"\bvim\s*:", re.I)
+# Verbatim/listings content and inline \verb / \lstinline spans are literal
+# document body, never live metadata, so metadata commands there must not be
+# cleaned (a \hypersetup shown as an example must survive).
+_VERBATIM_ENV_BEGIN_RE = re.compile(r"\\begin\{(verbatim\*?|lstlisting\*?|minted|Verbatim)\}", re.I)
+_VERBATIM_ENV_END_RE = re.compile(r"\\end\{(verbatim\*?|lstlisting\*?|minted|Verbatim)\}", re.I)
+_INLINE_VERBATIM_RE = re.compile(r"\\(verb\*?|lstinline\*?)(.)", re.I)
+
+
+def _is_latex_escaped(text: str, index: int) -> bool:
+    r"""True if text[index] is preceded by an odd number of backslashes.
+
+    ``\x`` escapes ``x``; ``\\`` is a linebreak. A '%' after an even (or zero)
+    backslash count starts a comment, after an odd count is a literal percent.
+    """
+    count = 0
+    j = index - 1
+    while j >= 0 and text[j] == "\\":
+        count += 1
+        j -= 1
+    return count % 2 == 1
+
+
+def _latex_comment_ranges(text: str) -> list[tuple[int, int]]:
+    r"""Return [start, end) ranges that are % comments (to end of line).
+
+    A '%' starts a comment unless preceded by an odd number of backslashes
+    (\% is an escaped percent sign; \\% is a linebreak followed by a comment).
+    Used to avoid treating a \hypersetup/\pdfinfo that appears *inside* a
+    comment as a live metadata command.
+    """
+    ranges: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "%" and not _is_latex_escaped(text, i):
+            start = i
+            j = text.find("\n", i)
+            end = n if j < 0 else j
+            ranges.append((start, end))
+            i = end
+        else:
+            i += 1
+    return ranges
+
+
+def _latex_verbatim_ranges(text: str) -> list[tuple[int, int]]:
+    r"""Return [start, end) ranges of verbatim/listings content to skip.
+
+    Covers verbatim/verbatim*/lstlisting/minted/Verbatim environments and
+    inline \verb / \verb* / \lstinline spans (delimiter follows the command).
+    """
+    ranges: list[tuple[int, int]] = []
+    for m in _VERBATIM_ENV_BEGIN_RE.finditer(text):
+        endm = _VERBATIM_ENV_END_RE.search(text, m.end())
+        if endm:
+            ranges.append((m.start(), endm.end()))
+    for m in _INLINE_VERBATIM_RE.finditer(text):
+        delim = m.group(2)
+        start = m.end()
+        # \lstinline may carry a '[language=...]' option group before the real
+        # delimiter, e.g. \lstinline[language=C]|code|. Skip the group and never
+        # treat '[' as a delimiter so the following delimiter is used. The scan
+        # is brace-aware (a braced value may contain ']', e.g. caption={a]b}).
+        if m.group(1).startswith("lstinline") and delim == "[":
+            close = -1
+            depth = 0
+            j = m.end()
+            while j < len(text):
+                ch = text[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                elif ch == "]" and depth == 0:
+                    close = j
+                    break
+                j += 1
+            if close < 0 or close + 1 >= len(text):
+                continue
+            start = close + 2
+            delim = text[close + 1]
+        if delim.isspace() or delim.isalnum() or delim in "\\{}":
+            continue
+        k = text.find(delim, start)
+        end = len(text) if k < 0 else k + 1
+        ranges.append((m.start(), end))
+    return ranges
+
+
+def _latex_merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and merge overlapping/nested [start, end) ranges.
+
+    A nested range (e.g. an inline \\verb span inside a verbatim environment)
+    would otherwise become the predecessor of the binary-search lookup and
+    hide the enclosing range from it.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges, key=lambda r: r[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _latex_line_iter_with_verbatim(text: str) -> Iterator[tuple[int, str, bool]]:
+    """Yield (offset, line, in_verbatim) for each line.
+
+    Flags lines that fall inside a verbatim/listings range so the % comment
+    passes in inspect_latex/clean_latex preserve literal percent-prefixed lines
+    in a verbatim or listings block.
+    """
+    ranges = _latex_merge_ranges(_latex_verbatim_ranges(text))
+    starts = [r[0] for r in ranges]
+    off = 0
+    for line in text.split("\n"):
+        idx = bisect.bisect_right(starts, off) - 1
+        in_vb = idx >= 0 and off < ranges[idx][1]
+        yield off, line, in_vb
+        off += len(line) + 1
+
+
+def _latex_matching_brace(text: str, open_idx: int) -> int:
+    r"""Return the '}' matching text[open_idx] == '{', or -1.
+
+    LaTeX % comments are skipped (an unescaped % runs to end of line), so a
+    '}' inside a comment cannot prematurely close the block.
+    """
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "%" and not _is_latex_escaped(text, i):
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            i = j + 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _latex_split_items(s: str) -> list[str]:
+    r"""Split a \hypersetup argument into top-level key=value item strings.
+
+    Commas at brace depth 0 delimit items; % comments are removed from the items
+    so a comment's comma/braces neither split nor affect a neighboring key.
+    Quotes are ordinary characters (no quote-mode state), so an apostrophe in a
+    title does not hide a following ','.
+    """
+    items: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            cur.append(s[i : i + 2])
+            i += 2
+            continue
+        if c == "%" and not _is_latex_escaped(s, i):
+            j = s.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "{":
+            depth += 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == "," and depth == 0:
+            items.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    items.append("".join(cur))
+    return items
+
+
+def _latex_split_key_value(item: str) -> tuple[str, str | None]:
+    r"""Split a \hypersetup 'key=value' item at the first top-level '='.
+
+    Quotes are ordinary characters (no quote-mode state), so an apostrophe in a
+    value does not conceal the '=' that follows it.
+    """
+    depth = 0
+    i, n = 0, len(item)
+    while i < n:
+        c = item[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+            i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            i += 1
+            continue
+        if c == "=" and depth == 0:
+            return item[:i].strip(), item[i + 1 :].strip()
+        i += 1
+    return item.strip(), None
+
+
+def _latex_pdfinfo_items(arg: str) -> list[tuple[str, str, int, int]]:
+    r"""Yield (key, value, value_start, value_end) for each '/Name ...' entry.
+
+    \pdfinfo entries are whitespace-separated '/Key <value>' pairs whose value is
+    a parenthesized string (may contain spaces and escaped parens), a <hex> string,
+    or a bare token (e.g. /False).
+    """
+    items: list[tuple[str, str, int, int]] = []
+    i, n = 0, len(arg)
+    while i < n:
+        while i < n and arg[i].isspace():
+            i += 1
+        if i < n and arg[i] == "%" and not _is_latex_escaped(arg, i):
+            j = arg.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if i >= n or arg[i] != "/":
+            i += 1
+            continue
+        key_start = i
+        i += 1
+        while i < n and not arg[i].isspace():
+            i += 1
+        key = arg[key_start:i]
+        while i < n and arg[i].isspace():
+            i += 1
+        value_start = i
+        if i < n and arg[i] == "(":
+            depth = 0
+            while i < n:
+                if arg[i] == "\\":
+                    i += 2
+                    continue
+                if arg[i] == "(":
+                    depth += 1
+                elif arg[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+        elif i < n and arg[i] == "<":
+            i += 1
+            while i < n and arg[i] != ">":
+                i += 1
+            if i < n:
+                i += 1
+        else:
+            while i < n and not arg[i].isspace():
+                i += 1
+        items.append((key, arg[value_start:i], value_start, i))
+    return items
+
+
+def _latex_entry_class(key: str, value: str | None) -> tuple[bool, bool, bool]:
+    r"""Return (ai, c2pa, clear) for one \hypersetup/\pdfinfo entry."""
+    lkey = key.lower().lstrip("/")
+    ai = bool(AI_META_NAME_RE.search(key) or (value and AI_META_NAME_RE.search(value)))
+    c2pa = bool(_C2PA_RE.search(key) or (value and _C2PA_RE.search(value)))
+    clear = lkey in _CLEAR_HYPER_KEYS or lkey in _CLEAR_PDFINFO_KEYS
+    return ai, c2pa, clear
+
+
+def _latex_clean_hypersetup(arg: str) -> tuple[str | None, list[tuple[str, bool, bool]]]:
+    r"""Drop provenance entries from a \hypersetup argument.
+
+    Returns (new_arg, removed) where new_arg is None when the block should be
+    dropped entirely, and removed is [(key, ai, c2pa), ...] for the entries
+    cleared (AI/C2PA-provenance keys and values, plus the always-clear metadata
+    field names).
+    """
+    kept: list[str] = []
+    removed: list[tuple[str, bool, bool]] = []
+    for raw in _latex_split_items(arg):
+        item = raw.strip()
+        if not item:
+            continue
+        key, value = _latex_split_key_value(item)
+        if key is None:
+            kept.append(item)
+            continue
+        ai, c2pa, clear = _latex_entry_class(key, value)
+        if ai or c2pa or clear:
+            removed.append((key, ai, c2pa))
+            continue
+        kept.append(item)
+    if not removed:
+        return arg, []
+    if not kept:
+        return None, removed
+    return ", ".join(kept), removed
+
+
+def _latex_clean_pdfinfo(arg: str) -> tuple[str | None, list[tuple[str, bool, bool]]]:
+    r"""Drop provenance entries from a \pdfinfo argument.
+
+    Returns (new_arg, removed) with the same contract as _latex_clean_hypersetup;
+    the always-clear /Author /Creator /Producer /Subject /Keywords /CreationDate
+    /ModDate fields and any AI/C2PA-marker entry are removed, /Title is kept.
+    """
+    kept: list[str] = []
+    removed: list[tuple[str, bool, bool]] = []
+    for key, value, _vs, _ve in _latex_pdfinfo_items(arg):
+        ai, c2pa, clear = _latex_entry_class(key, value)
+        if ai or c2pa or clear:
+            removed.append((key, ai, c2pa))
+            continue
+        kept.append(key if not value else f"{key} {value}")
+    if not removed:
+        return arg, []
+    if not kept:
+        return None, removed
+    return " ".join(kept), removed
+
+
+def _latex_comment_class(line: str) -> tuple[bool, str, bool]:
+    """Return (drop, label, ai) for a comment line (line already stripped).
+
+    Aggressive: drop AI-provenance comment lines, % !TEX tooling comments, and
+    Emacs/Vim modelines. Ordinary documentation comments survive.
+    """
+    if AI_META_NAME_RE.search(line):
+        return True, "AI markers", True
+    if _LATEX_MAGIC_COMMENT_RE.search(line):
+        return True, "magic comment", False
+    if "-*-" in line:
+        return True, "editor modeline", False
+    if _LATEX_VIM_MODELINE_RE.search(line):
+        return True, "editor modeline", False
+    return False, "", False
+
+
+def _latex_iter_meta_commands(text: str):
+    r"""Yield (cmd, arg, start, end) for each live \hypersetup/\pdfinfo block.
+
+    Skips % comments and verbatim/listings content (so a \hypersetup shown as a
+    literal example is not treated as live metadata) and inline \verb/\lstinline
+    spans. The comment/verbatim ranges are merged and looked up with a binary
+    search, so an adversarial run of commands costs O(log n) per command.
+    """
+    ranges = _latex_comment_ranges(text)
+    ranges.extend(_latex_verbatim_ranges(text))
+    # A comment or inline-verbatim range nested inside a verbatim block would
+    # otherwise hide the enclosing verbatim range from the predecessor lookup,
+    # so merge overlapping/nested intervals before the binary search.
+    ranges = _latex_merge_ranges(ranges)
+    starts = [r[0] for r in ranges]
+    for m in _META_CMD_OPEN_RE.finditer(text):
+        pos = m.start()
+        idx = bisect.bisect_right(starts, pos) - 1
+        if idx >= 0 and pos < ranges[idx][1]:
+            continue
+        cmd = m.group(1).lower()
+        brace_idx = m.end() - 1
+        close = _latex_matching_brace(text, brace_idx)
+        if close < 0:
+            continue
+        yield cmd, text[brace_idx + 1 : close], m.start(), close + 1
+
+
+def _latex_meta_key_values(cmd: str, arg: str) -> list[tuple[str, str | None]]:
+    r"""Extract (key, value) pairs from a \hypersetup or \pdfinfo argument."""
+    if cmd == "pdfinfo":
+        return [(key, value) for key, value, _vs, _ve in _latex_pdfinfo_items(arg)]
+    pairs: list[tuple[str, str | None]] = []
+    for raw in _latex_split_items(arg):
+        item = raw.strip()
+        if not item:
+            continue
+        key, value = _latex_split_key_value(item)
+        pairs.append((key, value) if key is not None else (item, None))
+    return pairs
+
+
+def inspect_latex(text: str) -> tuple[bool, bool, list[str], dict]:
+    r"""Inspect a LaTeX source for provenance/AI metadata and tooling comments.
+
+    Returns (has_c2pa, has_ai, findings, details); details carries command and
+    dropped-entry counts. Skips % comments and verbatim/listings content so
+    only live \hypersetup/\pdfinfo metadata and literal comment lines are seen.
+    """
+    findings: list[str] = []
+    has_ai = False
+    has_c2pa = False
+    keys_dropped = 0
+    comments_dropped = 0
+    commands = 0
+    for cmd, arg, _s, _e in _latex_iter_meta_commands(text):
+        commands += 1
+        for key, value in _latex_meta_key_values(cmd, arg):
+            ai, c2pa, clear = _latex_entry_class(key, value)
+            if not (ai or c2pa or clear):
+                continue
+            keys_dropped += 1
+            prefix = "latex ai:" if (ai or c2pa) else "info: latex"
+            findings.append(f"{prefix} {cmd} {key}")
+            if c2pa:
+                has_c2pa = True
+            if ai or c2pa:
+                has_ai = True
+    for _off, line, in_verbatim in _latex_line_iter_with_verbatim(text):
+        stripped = line.lstrip()
+        if in_verbatim or not stripped.startswith("%"):
+            continue
+        drop, label, ai = _latex_comment_class(stripped)
+        if drop:
+            comments_dropped += 1
+            prefix = "latex ai:" if ai else "info: latex"
+            findings.append(f"{prefix} comment ({label})")
+            if ai:
+                has_ai = True
+    details = {
+        "commands": commands,
+        "keys_dropped": keys_dropped,
+        "comments_dropped": comments_dropped,
+    }
+    return has_c2pa, has_ai or has_c2pa, findings, details
+
+
+def clean_latex(text: str) -> tuple[str, list[str]]:
+    r"""Strip LaTeX provenance metadata from a source.
+
+    Removes \hypersetup/\pdfinfo provenance entries and drops provenance-bearing
+    % comments plus % !TEX tooling comments and Emacs/Vim modelines. Verbatim and
+    listings content is left untouched. Returns (text, actions).
+    """
+    actions: list[str] = []
+    out: list[str] = []
+    last = 0
+    for cmd, arg, start, end in _latex_iter_meta_commands(text):
+        out.append(text[last:start])
+        if cmd == "hypersetup":
+            new_arg, removed = _latex_clean_hypersetup(arg)
+        else:
+            new_arg, removed = _latex_clean_pdfinfo(arg)
+        if new_arg is None:
+            actions.append(f"drop {cmd} block")
+        else:
+            out.append(f"\\{cmd}{{{new_arg}}}")
+            for key, _ai, _c2pa in removed:
+                actions.append(f"drop {cmd} {key.lower().lstrip('/')}")
+        last = end
+    out.append(text[last:])
+    text = "".join(out)
+
+    kept_lines: list[str] = []
+    dropped = 0
+    for _off, line, in_verbatim in _latex_line_iter_with_verbatim(text):
+        if in_verbatim:
+            kept_lines.append(line)
+            continue
+        stripped = line.lstrip()
+        drop, label, _ai = (
+            _latex_comment_class(stripped) if stripped.startswith("%") else (False, "", False)
+        )
+        if drop:
+            dropped += 1
+            actions.append(f"drop comment: {label}")
+            continue
+        kept_lines.append(line)
+    if dropped:
+        text = "\n".join(kept_lines)
+
+    if not actions:
+        actions.append("no LaTeX metadata removed")
+    return text, actions
 
 
 # ---------------------------------------------------------------------------
@@ -2975,6 +3500,9 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
     elif fmt == "markdown":
         body = data.decode("utf-8", errors="surrogateescape")
         has_c2pa, has_ai, findings, details = inspect_markdown(body)
+    elif fmt == "latex":
+        body = data.decode("utf-8", errors="surrogateescape")
+        has_c2pa, has_ai, findings, details = inspect_latex(body)
     else:
         has_c2pa, has_ai, findings = False, False, [f"unsupported container: {fmt}"]
         details = {"unsupported": True}
@@ -2983,7 +3511,7 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
     # inspect predicts clean rather than contradicting it.
     layer_a_total = 0
     layer_a_hits: list[dict] = []
-    if fmt in ("markdown", "html"):
+    if fmt in ("markdown", "html", "latex"):
         from text_unicode import inspect_text  # local import to avoid cycles
 
         ta = inspect_text(body).to_dict()
@@ -3036,6 +3564,10 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
     elif fmt == "epub":
         notes.append(
             "EPUB: package-document metadata, XHTML meta/JSON-LD, and embedded media are scanned"
+        )
+    elif fmt == "latex":
+        notes.append(
+            "LaTeX: \\hypersetup/\\pdfinfo provenance fields and provenance/tooling comment lines are scanned"
         )
     if "unsupported" in details:
         notes.append(f"format not fully inspected: {fmt}")
@@ -3131,6 +3663,17 @@ def clean_container(
     elif fmt == "markdown":
         text = data.decode("utf-8", errors="surrogateescape")
         text, actions = clean_markdown(text)
+        if also_layer_a_text:
+            text2, stats = clean_text(text, normalize_spaces=normalize_spaces)
+            if stats["removed_count"] or stats["replaced_count"]:
+                actions.append(
+                    f"layer A text: removed={stats['removed_count']} replaced={stats['replaced_count']}"
+                )
+                text = text2
+        safe_write_text(dest, text)
+    elif fmt == "latex":
+        text = data.decode("utf-8", errors="surrogateescape")
+        text, actions = clean_latex(text)
         if also_layer_a_text:
             text2, stats = clean_text(text, normalize_spaces=normalize_spaces)
             if stats["removed_count"] or stats["replaced_count"]:
